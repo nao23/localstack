@@ -5,7 +5,7 @@ from xml.sax.saxutils import escape
 from moto.cloudwatch import cloudwatch_backends
 from moto.cloudwatch.models import CloudWatchBackend, FakeAlarm
 
-from localstack.aws.api import RequestContext, handler
+from localstack.aws.api import CommonServiceException, RequestContext, handler
 from localstack.aws.api.cloudwatch import (
     AmazonResourceName,
     CloudwatchApi,
@@ -19,6 +19,7 @@ from localstack.aws.api.cloudwatch import (
 )
 from localstack.http import Request
 from localstack.services import moto
+from localstack.services.cloudwatch.alarm_schedule_util import schedule_metric_alarm
 from localstack.services.edge import ROUTER
 from localstack.services.plugins import ServiceLifecycleHook
 from localstack.utils.aws import aws_stack
@@ -168,6 +169,11 @@ def create_message_response_update_state(alarm, old_state):
     return json.dumps(response)
 
 
+class ValidationError(CommonServiceException):
+    def __init__(self, message: str):
+        super().__init__("ValidationError", message, 400, True)
+
+
 class CloudwatchProvider(CloudwatchApi, ServiceLifecycleHook):
     """
     Cloudwatch provider.
@@ -181,6 +187,12 @@ class CloudwatchProvider(CloudwatchApi, ServiceLifecycleHook):
 
     def on_after_init(self):
         ROUTER.add(PATH_GET_RAW_METRICS, self.get_raw_metrics)
+        # TODO init scheduler
+        # restart -> persistence
+
+    def on_before_stop(self):
+        # TODO shutdown scheduler
+        pass
 
     def get_raw_metrics(self, request: Request):
         region = aws_stack.extract_region_from_auth_header(request.headers)
@@ -226,11 +238,36 @@ class CloudwatchProvider(CloudwatchApi, ServiceLifecycleHook):
         context: RequestContext,
         request: PutMetricAlarmInput,
     ) -> None:
-        moto.call_moto(context)
+
+        # Supported values are [breaching, notBreaching, ignore, missing]
+        if not request.get("TreatMissingData"):
+            # missing is the default
+            request["TreatMissingData"] = "missing"
+            moto.call_moto_with_request(context, request)
+        else:
+            # validate "TreatMissingData" input
+            if not request.get("TreatMissingData") in [
+                "breaching",
+                "notBreaching",
+                "ignore",
+                "missing",
+            ]:
+                raise ValidationError(
+                    f"The value {request['TreatMissingData']} is not supported for TreatMissingData parameter. Supported values are [breaching, notBreaching, ignore, missing]."
+                )
+            # TODO verification of parameters
+            # period: Valid values are 10, 30, and any multiple of 60.
+            # statistic: possible values: SampleCount, Average, Sum, Minimum, Maximum; either Statistics or ExtendedStatics can be set -> not both!
+            # ExtendedStatistics:
+            # Unit: list of possible values
+            # EvaluationPeriod: number multiplied by period, must not be greater than 86,400
+            # datapoints-to-alarm
+            moto.call_moto(context)
 
         name = request.get("AlarmName")
         arn = aws_stack.cloudwatch_alarm_arn(name)
         self.tags.tag_resource(arn, request.get("Tags"))
+        schedule_metric_alarm(name)
 
     @handler("PutCompositeAlarm", expand=False)
     def put_composite_alarm(
@@ -238,7 +275,6 @@ class CloudwatchProvider(CloudwatchApi, ServiceLifecycleHook):
         context: RequestContext,
         request: PutCompositeAlarmInput,
     ) -> None:
-        pass
         backend = cloudwatch_backends[context.region]
         backend.put_metric_alarm(
             name=request.get("AlarmName"),
