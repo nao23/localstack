@@ -19,7 +19,7 @@ from localstack.aws.api.cloudwatch import (
 )
 from localstack.http import Request
 from localstack.services import moto
-from localstack.services.cloudwatch.alarm_schedule_util import schedule_metric_alarm
+from localstack.services.cloudwatch.alarm_schedule_util import AlarmScheduler
 from localstack.services.edge import ROUTER
 from localstack.services.plugins import ServiceLifecycleHook
 from localstack.utils.aws import aws_stack
@@ -184,15 +184,19 @@ class CloudwatchProvider(CloudwatchApi, ServiceLifecycleHook):
 
     def __init__(self):
         self.tags = TaggingService()
+        self.alarm_scheduler = None
 
     def on_after_init(self):
         ROUTER.add(PATH_GET_RAW_METRICS, self.get_raw_metrics)
+        self.alarm_scheduler = AlarmScheduler()  # TODO start in new thread
         # TODO init scheduler
-        # restart -> persistence
+        # TODO restart -> persistence
 
     def on_before_stop(self):
         # TODO shutdown scheduler
-        pass
+        self.alarm_scheduler.shutdown_scheduler()
+
+    # TODO delete scheduler on delete_alarm
 
     def get_raw_metrics(self, request: Request):
         region = aws_stack.extract_region_from_auth_header(request.headers)
@@ -267,7 +271,7 @@ class CloudwatchProvider(CloudwatchApi, ServiceLifecycleHook):
         name = request.get("AlarmName")
         arn = aws_stack.cloudwatch_alarm_arn(name)
         self.tags.tag_resource(arn, request.get("Tags"))
-        schedule_metric_alarm(name)
+        self.alarm_scheduler.schedule_metric_alarm(arn)
 
     @handler("PutCompositeAlarm", expand=False)
     def put_composite_alarm(

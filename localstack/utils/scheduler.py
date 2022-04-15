@@ -42,6 +42,9 @@ class ScheduledTask:
         return self._cancelled
 
     def set_next_deadline(self):
+        """
+        Internal method to update the next deadline of this task based on the period and the current time.
+        """
         if not self.deadline:
             raise ValueError("Deadline was not initialized")
 
@@ -55,7 +58,7 @@ class ScheduledTask:
 
     def run(self):
         """
-        :return:
+        Executes the task function. If the function raises and Exception, ``on_error`` is called (if set).
         """
         try:
             self.task(*self.args, **self.kwargs)
@@ -66,7 +69,8 @@ class ScheduledTask:
 
 class Scheduler:
     """
-    An event-loop based task scheduler that can be parallelized with an executor.
+    An event-loop based task scheduler that can manage multiple scheduled tasks with different periods,
+    can be parallelized with an executor.
     """
 
     POISON = (-1, "__POISON__")
@@ -74,7 +78,9 @@ class Scheduler:
     def __init__(self, executor: Optional[Executor] = None) -> None:
         """
         Creates a new Scheduler. If an executor is passed, then that executor will be used to run the scheduled tasks
-        asynchronously, otherwise they will be executed synchronously inside the event loop.
+        asynchronously, otherwise they will be executed synchronously inside the event loop. Running tasks
+        asynchronously in an executor means that they will be effectively executed at a fixed rate (scheduling with
+        ``fixed_rate = False``, will have no effect).
         :param executor: an optional executor that tasks will be submitted to.
         """
         super().__init__()
@@ -102,7 +108,7 @@ class Scheduler:
         :param on_error: error callback
         :param args: additional positional arguments to pass to the function
         :param kwargs: additional keyword arguments to pass to the function
-        :return a ScheduledTask instance
+        :return: a ScheduledTask instance
         """
         st = ScheduledTask(
             func,
@@ -117,10 +123,18 @@ class Scheduler:
         return st
 
     def schedule_task(self, task: ScheduledTask) -> None:
+        """
+        Schedules the given task and sets the deadline of the task to either ``task.start`` or the current time.
+        :param task: the task to schedule
+        """
         task.deadline = max(task.start or 0, time.time())
         self.add(task)
 
     def add(self, task: ScheduledTask) -> None:
+        """
+        Schedules the given task. Requires that the task has a deadline set. It's better to use ``schedule_task``.
+        :param task: the task to schedule.
+        """
         if task.deadline is None:
             raise ValueError
 
@@ -132,7 +146,7 @@ class Scheduler:
 
     def close(self) -> None:
         """
-        Termintes the run loop.
+        Terminates the run loop.
         """
         with self._condition:
             self._queue.put(self.POISON)
@@ -154,28 +168,29 @@ class Scheduler:
             if task.is_cancelled:
                 continue
 
-            w = max(0, deadline - time.time())
-            if w > 0:
+            # wait until the task should be executed
+            wait = max(0, deadline - time.time())
+            if wait > 0:
                 with cond:
-                    interrupted = cond.wait(timeout=w)
+                    interrupted = cond.wait(timeout=wait)
                     if interrupted:
-                        # something with a potentially earlier deadline has arrived
-                        # the naive thing is to requeue and retry
-                        # could optimize by checking the deadline of the added element(s), but that would be fairly
-                        # involved. the assumption is that schedule is not invoked frequently
+                        # something with a potentially earlier deadline has arrived while waiting, so we re-queue and
+                        # continue. this could be optimized by checking the deadline of the added element(s) first,
+                        # but that would be fairly involved. the assumption is that `schedule` is not invoked frequently
                         q.put((task.deadline, task))
                         continue
+
+            # run or submit the task
+            if not task.is_cancelled:
+                if executor:
+                    executor.submit(task.run)
+                else:
+                    task.run()
 
             if task.is_periodic:
                 try:
                     task.set_next_deadline()
                 except ValueError:
                     # task deadline couldn't be set because it was cancelled
-                    return
+                    continue
                 q.put((task.deadline, task))
-
-            if not task.is_cancelled:
-                if executor:
-                    executor.submit(task.run)
-                else:
-                    task.run()

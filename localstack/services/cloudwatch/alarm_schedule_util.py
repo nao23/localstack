@@ -1,4 +1,7 @@
-from datetime import datetime, timedelta
+import logging
+import threading
+import traceback
+from datetime import datetime, timedelta, timezone
 
 from localstack.utils.aws import aws_stack
 
@@ -6,6 +9,10 @@ from localstack.utils.aws import aws_stack
 # LessThanLowerOrGreaterThanUpperThreshold
 # LessThanLowerThreshold
 # GreaterThanUpperThreshold
+from localstack.utils.scheduler import Scheduler
+
+LOG = logging.getLogger(__name__)
+
 COMPARISON_OPS = {
     "GreaterThanOrEqualToThreshold": (lambda value, threshold: value >= threshold),
     "GreaterThanThreshold": (lambda value, threshold: value > threshold),
@@ -19,10 +26,50 @@ STATE_INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
 REASON = "Alarm Evaluation"  # TODO
 
 
-def schedule_metric_alarm(alarm_name):
-    """(Re-)schedules the alarm"""
-    # TODO check if alarm is currently running
-    pass
+class AlarmScheduler:
+    def __init__(self) -> None:
+        super().__init__()
+        self.scheduler = Scheduler()
+        self.thread = threading.Thread(target=self.scheduler.run)
+        self.thread.start()
+        self.scheduled_alarms = {}
+
+    def shutdown_scheduler(self):
+        self.scheduler.close()
+        self.thread.join(5)
+
+    def schedule_metric_alarm(self, alarm_arn):
+        """(Re-)schedules the alarm"""
+        # TODO check if alarm is currently running
+        alarm_details = get_metric_alarm_details_for_alarm_arn(alarm_arn)
+        task = self.scheduled_alarms.get(alarm_arn)
+        if task:
+            task.cancel()
+
+        period = alarm_details["Period"]
+        evaluation_periods = alarm_details["EvaluationPeriods"]
+        schedule_period = evaluation_periods * period
+
+        def on_error(e):
+            LOG.error(f"Error executing scheduled alarm: {e}")
+            LOG.error(traceback.format_exc())
+
+        task = self.scheduler.schedule(
+            func=calculate_alarm_state, period=schedule_period, args=[alarm_arn], on_error=on_error
+        )
+
+        self.scheduled_alarms[alarm_arn] = task
+
+
+def get_metric_alarm_details_for_alarm_arn(alarm_arn):
+    alarm_name = aws_stack.extract_resource_from_arn(alarm_arn).split(":", 1)[1]
+    client = get_cloudwatch_client_for_region_of_alarm(alarm_arn)
+    return client.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+
+
+def get_cloudwatch_client_for_region_of_alarm(alarm_arn):
+    region = aws_stack.extract_region_from_arn(alarm_arn)
+    return aws_stack.connect_to_service("cloudwatch", region_name=region)
 
 
 def generate_metric_query(alarm_details):
@@ -33,10 +80,10 @@ def generate_metric_query(alarm_details):
                 "Namespace": alarm_details["Namespace"],
                 "MetricName": alarm_details["MetricName"],
                 "Dimensions": alarm_details["Dimensions"],
-            }
+            },
+            "Period": alarm_details["Period"],
+            "Stat": alarm_details["Statistic"],
         },
-        "Period": alarm_details["Period"],
-        "Stat": alarm_details["Statistic"],
         # TODO other fields might be required
     }
 
@@ -79,7 +126,9 @@ def is_triggering_premature_alarm(metric_values, datapoints, alarm_details):
     return False
 
 
-def calculate_alarm_state(alarm_details):
+def calculate_alarm_state(alarm_arn):
+    alarm_details = get_metric_alarm_details_for_alarm_arn(alarm_arn)
+    client = get_cloudwatch_client_for_region_of_alarm(alarm_arn)
 
     # Whenever an alarm evaluates whether to change state, CloudWatch attempts to retrieve a higher number of data points than the number specified as Evaluation Periods.
     magic_number = 2
@@ -91,8 +140,7 @@ def calculate_alarm_state(alarm_details):
     period = alarm_details["Period"]
     # TODO evaluation_interval = (evaluation_periods + magic_number) * alarm_details["Period"]
 
-    now = datetime.utcnow()
-    client = aws_stack.connect_to_service("cloudwatch")
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
     metric_query = generate_metric_query(alarm_details)
 
     metric_values = []
@@ -108,14 +156,14 @@ def calculate_alarm_state(alarm_details):
         now = start_time
 
     alarm_name = alarm_details["AlarmName"]
-    alarm_state = alarm_details["AlarmState"]
+    alarm_state = alarm_details["StateValue"]
     treat_missing_data = alarm_details["TreatMissingData"]
 
     empty_datapoints = metric_values.count(None)
     if empty_datapoints == collected_periods:
         if treat_missing_data == "missing":
             client.set_alarm_state(
-                AlarmName=alarm_name, AlarmState=STATE_INSUFFICIENT_DATA, AlarmReason=REASON
+                AlarmName=alarm_name, StateValue=STATE_INSUFFICIENT_DATA, StateReason=REASON
             )
             return
         elif treat_missing_data == "ignore":
@@ -132,7 +180,7 @@ def calculate_alarm_state(alarm_details):
         if is_triggering_premature_alarm(metric_values, datapoints, alarm_details):
             if treat_missing_data == "missing" and alarm_state != STATE_ALARM:
                 client.set_alarm_state(
-                    AlarmName=alarm_name, AlarmState=STATE_ALARM, AlarmReason=REASON
+                    AlarmName=alarm_name, StateValue=STATE_ALARM, StateReason=REASON
                 )  # TODO add region?
             # for 'ignore' the state should be retained
             return
@@ -149,8 +197,6 @@ def calculate_alarm_state(alarm_details):
 
     if is_threshold_exceeded(collected_datapoints, alarm_details):
         if alarm_state != STATE_ALARM:
-            client.set_alarm_state(
-                AlarmName=alarm_name, AlarmState=STATE_ALARM, AlarmReason=REASON
-            )  # TODO add region?
+            client.set_alarm_state(AlarmName=alarm_name, StateValue=STATE_ALARM, StateReason=REASON)
     elif alarm_state != STATE_OK:
-        client.set_alarm_state(AlarmName=alarm_name, AlarmState=STATE_OK, AlarmReason=REASON)
+        client.set_alarm_state(AlarmName=alarm_name, StateValue=STATE_OK, StateReason=REASON)
