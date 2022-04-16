@@ -1,10 +1,9 @@
 """
 A set of common handlers to build an AWS server application.
 """
-import json
 import logging
 from functools import lru_cache
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from botocore.model import ServiceModel
 from werkzeug.datastructures import Headers
@@ -415,13 +414,43 @@ class InternalFailureHandler(ExceptionHandler):
 
         LOG.debug("setting internal failure response for %s", exception)
         response.status_code = 500
-        response.data = json.dumps(
+        response.set_json(
             {
                 "message": "Unexpected exception",
                 "error": str(exception),
                 "type": str(exception.__class__.__name__),
             }
-        ).encode("utf-8")
+        )
+
+
+class ServiceHandlerChain(Handler):
+    service: ServiceModel
+
+    request_handlers: List[Handler]
+    response_handlers: List[Handler]
+    exception_handlers: List[ExceptionHandler]
+
+    def __init__(self, service: ServiceModel):
+        self.service = service
+        self.request_handlers = []
+        self.response_handlers = []
+        self.exception_handlers = []
+
+    def __call__(self, outer: HandlerChain, context: RequestContext, response: Response):
+        inner = self.new_chain()
+        inner.handle(context, response)
+
+        if inner.terminated:
+            inner.terminate()
+        elif inner.stopped:
+            outer.stop()
+        elif inner.error:
+            outer.error = inner.error
+
+        # TODO: how to handle?
+
+    def new_chain(self) -> HandlerChain:
+        return HandlerChain(self.request_handlers, self.response_handlers, self.exception_handlers)
 
 
 class LegacyPluginHandler(Handler):

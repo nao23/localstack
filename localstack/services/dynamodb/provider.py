@@ -1,14 +1,15 @@
 import copy
+import functools
 import json
 import logging
 import random
 import re
 import time
 import traceback
-from typing import Dict, List
+from binascii import crc32
+from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional
 
 import requests
-import werkzeug
 
 from localstack import config, constants
 from localstack.aws.api import (
@@ -34,6 +35,7 @@ from localstack.aws.api.dynamodb import (
     DescribeKinesisStreamingDestinationOutput,
     DescribeTableOutput,
     DescribeTimeToLiveOutput,
+    DestinationStatus,
     DynamodbApi,
     ExecuteStatementInput,
     ExecuteStatementOutput,
@@ -66,7 +68,9 @@ from localstack.aws.api.dynamodb import (
     TableName,
     TagKeyList,
     TagList,
+    TimeToLiveDescription,
     TimeToLiveSpecification,
+    TimeToLiveStatus,
     TransactWriteItemsInput,
     TransactWriteItemsOutput,
     UpdateGlobalTableOutput,
@@ -76,10 +80,11 @@ from localstack.aws.api.dynamodb import (
     UpdateTableOutput,
     UpdateTimeToLiveOutput,
 )
+from localstack.aws.chain import Handler, HandlerChain
 from localstack.aws.forwarder import HttpFallbackDispatcher, get_request_forwarder_http
 from localstack.aws.proxy import AwsApiListener
 from localstack.constants import LOCALHOST
-from localstack.http import Response
+from localstack.http import Request, Response
 from localstack.services.awslambda import lambda_api
 from localstack.services.dynamodb import server
 from localstack.services.dynamodb.server import start_dynamodb, wait_for_dynamodb
@@ -331,7 +336,119 @@ class DynamoDBApiListener(AwsApiListener):
             table_definitions[data["TableName"]] = data
 
 
-class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
+class _AwsRequestHandler(NamedTuple):
+    service: str
+    handler: Handler
+
+
+class _aws_request_handler:
+    def __init__(self, fn, priority: int = 0):
+        self.fn = fn
+        self.priority = priority
+
+    def __set_name__(self, owner, name):
+        self.fn.class_name = owner.__name__
+        setattr(owner, name, self.fn)
+
+
+def aws_request_handler(priority: int = 0):
+    def _wrapper(fn: Handler):
+        return _aws_request_handler(fn, priority)
+
+    return _wrapper
+
+
+def aws_response_handler(service: Optional[str] = None):
+    def _wrapper(fn: Handler):
+        fn._service = service
+        fn._aws_response_handler = fn
+        return fn
+
+    return _wrapper
+
+
+class DynamodbRequestThrottler:
+    @aws_request_handler()
+    def throttle_request(
+        self, chain: HandlerChain, context: RequestContext, response: Response
+    ) -> None:
+        if self.should_throttle(context.operation.name):
+            message = (
+                "The level of configured provisioned throughput for the table was exceeded. "
+                + "Consider increasing your provisioning level with the UpdateTable API"
+            )
+            raise ProvisionedThroughputExceededException(message)
+
+    def action_should_throttle(self, action, actions):
+        throttled = [f"{ACTION_PREFIX}{a}" for a in actions]
+        return (action in throttled) or (action in actions)
+
+    def should_throttle(self, action):
+        rand = random.random()
+        if rand < config.DYNAMODB_READ_ERROR_PROBABILITY and self.action_should_throttle(
+            action, READ_THROTTLED_ACTIONS
+        ):
+            return True
+        elif rand < config.DYNAMODB_WRITE_ERROR_PROBABILITY and self.action_should_throttle(
+            action, WRITE_THROTTLED_ACTIONS
+        ):
+            return True
+        elif rand < config.DYNAMODB_ERROR_PROBABILITY and self.action_should_throttle(
+            action, THROTTLED_ACTIONS
+        ):
+            return True
+        else:
+            return False
+
+
+class DynamodblocalArnFixer:
+    @aws_response_handler()
+    def fix_arns(self, chain: HandlerChain, context: RequestContext, response: Response) -> None:
+        # fix the table and latest stream ARNs (DynamoDBLocal hardcodes "ddblocal" as the region)
+        content_replaced = re.sub(
+            r'("TableArn"|"LatestStreamArn"|"StreamArn")\s*:\s*"arn:aws:dynamodb:ddblocal:([^"]+)"',
+            rf'\1: "arn:aws:dynamodb:{aws_stack.get_region()}:\2"',
+            response.get_data(True),
+        )
+        response.data = content_replaced
+
+        # set x-amz-crc32 headers required by some client
+        response.headers["x-amz-crc32"] = crc32(response.get_data(False)) & 0xFFFFFFFF
+
+        # update table definitions
+        response = response.get_json(silent=True)
+        if response and "TableName" in response and "KeySchema" in response:
+            table_definitions = DynamoDBRegion.get().table_definitions
+            table_definitions[response["TableName"]] = response
+
+
+class DynamodblocalShell:
+    def get_forward_url(self) -> str:
+        raise NotImplementedError
+
+    @route("/shell", methods=["GET"])
+    def handle_shell_ui_redirect(self, request: Request) -> Response:
+        headers = {"Refresh": f"0; url={config.service_url('dynamodb')}/shell/index.html"}
+        return Response("", headers=headers)
+
+    @route("/shell/<regex('.*'):req_path>")
+    def handle_shell_ui_request(self, request: Request, req_path: str) -> Response:
+        # TODO: "DynamoDB Local Web Shell was deprecated with version 1.16.X and is not available any
+        #  longer from 1.17.X to latest. There are no immediate plans for a new Web Shell to be introduced."
+        #  -> keeping this for now, to allow configuring custom installs; should consider removing it in the future
+        # https://repost.aws/questions/QUHyIzoEDqQ3iOKlUEp1LPWQ#ANdBm9Nz9TRf6VqR3jZtcA1g
+        req_path = f"/{req_path}" if not req_path.startswith("/") else req_path
+        url = f"{self.get_forward_url()}/shell{req_path}"
+        result = requests.request(
+            method=request.method, url=url, headers=request.headers, data=request.data
+        )
+
+        return Response(result.content, headers=dict(result.headers), status=result.status_code)
+
+
+class DynamoDBProvider(
+    DynamodbApi, DynamodbRequestThrottler, DynamodblocalArnFixer, ServiceLifecycleHook
+):
     def __init__(self):
         self.request_forwarder = get_request_forwarder_http(self.get_forward_url)
 
@@ -361,7 +478,7 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
         start_dynamodb()
         wait_for_dynamodb()
 
-    def handle_shell_ui_redirect(self, request: werkzeug.Request) -> Response:
+    def handle_shell_ui_redirect(self, request: Request) -> Response:
         headers = {"Refresh": f"0; url={config.service_url('dynamodb')}/shell/index.html"}
         return Response("", headers=headers)
 
@@ -825,7 +942,9 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
         backend = DynamoDBRegion.get()
 
         ttl_spec = backend.ttl_specifications.get(table_name)
-        result = {"TimeToLiveStatus": "DISABLED"}
+
+        result = TimeToLiveDescription()
+        result["TimeToLiveStatus"] = TimeToLiveStatus.DISABLED
         if ttl_spec:
             if ttl_spec.get("Enabled"):
                 ttl_status = "ENABLED"
@@ -952,7 +1071,7 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
         )
         table_def["KinesisDataStreamDestinationStatus"] = "ACTIVE"
         return KinesisStreamingDestinationOutput(
-            DestinationStatus="ACTIVE", StreamArn=stream_arn, TableName=table_name
+            DestinationStatus=DestinationStatus.ACTIVE, StreamArn=stream_arn, TableName=table_name
         )
 
     def disable_kinesis_streaming_destination(
@@ -978,7 +1097,7 @@ class DynamoDBProvider(DynamodbApi, ServiceLifecycleHook):
                         dest["DestinationStatusDescription"] = ("Stream is disabled",)
                         table_def["KinesisDataStreamDestinationStatus"] = "DISABLED"
                         return KinesisStreamingDestinationOutput(
-                            DestinationStatus="DISABLED",
+                            DestinationStatus=DestinationStatus.DISABLED,
                             StreamArn=stream_arn,
                             TableName=table_name,
                         )

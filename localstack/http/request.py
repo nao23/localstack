@@ -1,12 +1,32 @@
 import json
 from io import BytesIO
-from typing import IO, Any, Dict, Optional, Tuple, Union
+from typing import IO, Any, Dict, Optional, Tuple, Union, TYPE_CHECKING
 
 from werkzeug.datastructures import Headers
 from werkzeug.sansio.request import Request as _SansIORequest
 from werkzeug.utils import cached_property
 
+if TYPE_CHECKING:
+    from _typeshed.wsgi import WSGIEnvironment
+
 from localstack.utils.common import to_bytes
+
+
+def dummy_wsgi_environment(
+        method: str = "GET",
+        path: str = "",
+        headers: Union[Dict, Headers] = None,
+        body: Union[bytes, str] = None,
+        scheme: str = "http",
+        root_path: str = "/",
+        query_string: Union[bytes, str] = b"",
+        remote_addr: str = None,
+        server: Optional[Tuple[str, Optional[int]]] = None,
+        raw_path: str = None,
+) -> "WSGIEnvironment":
+    return {
+
+    }
 
 
 class Request(_SansIORequest):

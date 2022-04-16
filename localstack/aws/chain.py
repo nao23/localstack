@@ -150,3 +150,48 @@ class HandlerChainAdapter(Handler):
         :return:
         """
         self.chain.request_handlers.append(handler)
+
+
+class HandlerTree(Handler):
+    # handlers
+    request_handlers: List[Handler]
+    response_handlers: List[Handler]
+    exception_handlers: List[ExceptionHandler]
+
+    # behavior configuration
+    stop_on_error: bool = True
+    raise_on_error: bool = False
+    propagate: bool = True
+
+    def __init__(
+        self,
+        request_handlers: List[Handler] = None,
+        response_handlers: List[Handler] = None,
+        exception_handlers: List[ExceptionHandler] = None,
+    ):
+        self.request_handlers = request_handlers or []
+        self.response_handlers = response_handlers or []
+        self.exception_handlers = exception_handlers or []
+
+    def __call__(self, outer: HandlerChain, context: RequestContext, response: Response):
+        inner = self.create_chain()
+
+        self.on_before_handle(outer, inner)
+        inner.handle(context, response)
+
+        if self.propagate:
+            if inner.terminated:
+                inner.terminate()
+            elif inner.stopped:
+                outer.stop()
+            elif inner.error:
+                outer.error = inner.error
+
+    def on_before_handle(self, outer: HandlerChain, inner: HandlerChain):
+        pass
+
+    def create_chain(self) -> HandlerChain:
+        chain = HandlerChain(self.request_handlers, self.response_handlers, self.exception_handlers)
+        chain.stop_on_error = self.stop_on_error
+        chain.raise_on_error = self.raise_on_error
+        return chain
