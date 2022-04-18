@@ -1,4 +1,5 @@
 import logging
+from functools import lru_cache
 from typing import NamedTuple, Optional
 
 from werkzeug.http import parse_dict_header
@@ -86,7 +87,15 @@ def custom_signing_name_rules(signing_name: str, request: Request) -> Optional[s
     return rules.get("*", signing_name)
 
 
-def guess_aws_service_name(services: ServiceCatalog, request: Request) -> str:
+@lru_cache()
+def get_service_catalog() -> ServiceCatalog:
+    return ServiceCatalog()
+
+
+def guess_aws_service_name(request: Request, services: ServiceCatalog = None) -> Optional[str]:
+    if services is None:
+        services = get_service_catalog()
+
     signing_name, target_prefix, operation = get_header_indicators(request)
 
     candidates = set()
@@ -126,14 +135,11 @@ def guess_aws_service_name(services: ServiceCatalog, request: Request) -> str:
                 candidates.update(services)
 
     if len(candidates) == 0:
-        raise ValueError(
-            "could not determine service for request %s %s %s"
-            % (request.method, request.url, request.headers)
-        )
+        return None
 
     LOG.warning("could not uniquely determine service from request, candidates=%s", candidates)
 
     if signing_name:
         return signing_name
+
     return candidates.pop()
-    # raise NoRoute(candidates=candidates, indicators=ServiceIndicators(signing_name, target_prefix, operation))
