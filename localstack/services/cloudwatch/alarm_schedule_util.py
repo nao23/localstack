@@ -1,18 +1,18 @@
 import logging
+import math
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
 
 from localstack.utils.aws import aws_stack
+from localstack.utils.scheduler import Scheduler
+
+LOG = logging.getLogger(__name__)
 
 # TODO used for anomaly detection models:
 # LessThanLowerOrGreaterThanUpperThreshold
 # LessThanLowerThreshold
 # GreaterThanUpperThreshold
-from localstack.utils.scheduler import Scheduler
-
-LOG = logging.getLogger(__name__)
-
 COMPARISON_OPS = {
     "GreaterThanOrEqualToThreshold": (lambda value, threshold: value >= threshold),
     "GreaterThanThreshold": (lambda value, threshold: value > threshold),
@@ -39,8 +39,8 @@ class AlarmScheduler:
         self.thread.join(5)
 
     def schedule_metric_alarm(self, alarm_arn):
-        """(Re-)schedules the alarm"""
-        # TODO check if alarm is currently running
+        """(Re-)schedules the alarm, if the alarm is re-scheduled, the running alarm scheduler will be cancelled before
+        starting a new one"""
         alarm_details = get_metric_alarm_details_for_alarm_arn(alarm_arn)
         task = self.scheduled_alarms.get(alarm_arn)
         if task:
@@ -73,6 +73,7 @@ def get_cloudwatch_client_for_region_of_alarm(alarm_arn):
 
 
 def generate_metric_query(alarm_details):
+    """Creates the dict with the required data for MetricDataQueries when calling client.get_metric_data"""
     return {
         "Id": alarm_details["AlarmName"],
         "MetricStat": {
@@ -89,6 +90,13 @@ def generate_metric_query(alarm_details):
 
 
 def is_threshold_exceeded(metric_values, alarm_details):
+    """Evaluates if the threshold is exceeded for the configured alarm and given metric values
+
+    :param metric_values: values to compare against threshold
+    :param alarm_details: Alarm Description, as returned from describe_alarms
+
+    :return: True if threshold is exceeded, else False
+    """
     threshold = alarm_details["Threshold"]
     comparison_operator = alarm_details["ComparisonOperator"]
     treat_missing_data = alarm_details["TreatMissingData"]
@@ -100,7 +108,7 @@ def is_threshold_exceeded(metric_values, alarm_details):
                 evaluated_datapoints.append(True)
             elif treat_missing_data == "notBreaching":
                 evaluated_datapoints.append(False)
-            # else we can ignore the data TODO should actually not happen
+            # else we can ignore the data
         else:
             evaluated_datapoints.append(COMPARISON_OPS.get(comparison_operator)(value, threshold))
 
@@ -110,41 +118,60 @@ def is_threshold_exceeded(metric_values, alarm_details):
     return False
 
 
-def is_triggering_premature_alarm(metric_values, datapoints, alarm_details):
-    treat_missing_data = alarm_details["TreatMissingData"]
+def is_triggering_premature_alarm(metric_values, alarm_details):
+    """
+    Checks if a premature alarm should be triggered.
+    https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html#CloudWatch-alarms-avoiding-premature-transition:
 
-    if (
-        datapoints == 1
-        and metric_values[-1] is None
-        and treat_missing_data in ("missing", "ignore")
-    ):
+    [...] alarms are designed to always go into ALARM state when the oldest available breaching datapoint during the Evaluation
+    Periods number of data points is at least as old as the value of Datapoints to Alarm, and all other more recent data
+    points are breaching or missing. In this case, the alarm goes into ALARM state even if the total number of datapoints
+    available is lower than M (Datapoints to Alarm).
+    This alarm logic applies to M out of N alarms as well.
+    """
+    treat_missing_data = alarm_details["TreatMissingData"]
+    if treat_missing_data not in ("missing", "ignore"):
+        return False
+
+    datapoints_to_alarm = alarm_details.get("DatapointsToAlarm", 1)
+    if datapoints_to_alarm > 1:
         comparison_operator = alarm_details["ComparisonOperator"]
         threshold = alarm_details["Threshold"]
-        value = list(filter(None, metric_values))[0]
-        if COMPARISON_OPS.get(comparison_operator)(value, threshold):
-            return True
+        oldest_datapoints = metric_values[:-datapoints_to_alarm]
+        if oldest_datapoints.count(None) == len(oldest_datapoints):
+            if metric_values[-datapoints_to_alarm] and COMPARISON_OPS.get(comparison_operator)(
+                metric_values[-datapoints_to_alarm], threshold
+            ):
+                values = list(filter(None, metric_values[len(oldest_datapoints) :]))
+                if all(
+                    COMPARISON_OPS.get(comparison_operator)(value, threshold) for value in values
+                ):
+                    return True
     return False
 
 
-def calculate_alarm_state(alarm_arn):
-    alarm_details = get_metric_alarm_details_for_alarm_arn(alarm_arn)
-    client = get_cloudwatch_client_for_region_of_alarm(alarm_arn)
+def collect_metric_data(alarm_details, client):
+    """
+    Collects the metric data for the evaluation interval.
 
-    # Whenever an alarm evaluates whether to change state, CloudWatch attempts to retrieve a higher number of data points than the number specified as Evaluation Periods.
-    magic_number = 2
-
-    # The number of periods over which data is compared to the specified threshold. If you are setting an alarm that
-    # requires that a number of consecutive data points be breaching to trigger the alarm, this value specifies that number.
-    # If you are setting an “M out of N” alarm, this value is the N.
+    :param alarm_details: the alarm details as returned by describe_alarms
+    :param client: the cloudwatch client
+    :return: list with data points
+    """
+    metric_values = []
     evaluation_periods = alarm_details["EvaluationPeriods"]
     period = alarm_details["Period"]
-    # TODO evaluation_interval = (evaluation_periods + magic_number) * alarm_details["Period"]
+
+    # From the docs: "Whenever an alarm evaluates whether to change state, CloudWatch attempts to retrieve a higher number of data
+    # points than the number specified as Evaluation Periods."
+    # No other indication, try to calculate a reasonable value:
+    magic_number = max(math.floor(evaluation_periods / 3), 2)
 
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
     metric_query = generate_metric_query(alarm_details)
-
-    metric_values = []
     collected_periods = evaluation_periods + magic_number
+
+    # get_metric_data needs to be run in a loop, so we also collect empty data points on the right position
     for i in range(0, collected_periods):
         start_time = now - timedelta(seconds=period)
         end_time = now
@@ -154,39 +181,59 @@ def calculate_alarm_state(alarm_arn):
         val = metric_data["Values"]
         metric_values.append(val[0] if val else None)
         now = start_time
+    return metric_values
+
+
+def update_alarm_state(client, alarm_name, current_state, desired_state):
+    """Updates the alarm state, if the current_state is different than the desired_state
+
+    :param client: the cloudwatch client
+    :param alarm_name: the name of the alarm
+    :param current_state: the state the alarm is currently in
+    :param desired_state: the state the alarm should have after updating
+    """
+    if current_state == desired_state:
+        return
+    client.set_alarm_state(AlarmName=alarm_name, StateValue=desired_state, StateReason=REASON)
+
+
+def calculate_alarm_state(alarm_arn):
+    """
+    Calculates and updates the state of the alarm
+
+    :param alarm_arn: the arn of the alarm to be evaluated
+    """
+    alarm_details = get_metric_alarm_details_for_alarm_arn(alarm_arn)
+    client = get_cloudwatch_client_for_region_of_alarm(alarm_arn)
+
+    metric_values = collect_metric_data(alarm_details, client)
 
     alarm_name = alarm_details["AlarmName"]
     alarm_state = alarm_details["StateValue"]
     treat_missing_data = alarm_details["TreatMissingData"]
 
     empty_datapoints = metric_values.count(None)
-    if empty_datapoints == collected_periods:
+    if empty_datapoints == len(metric_values):
         if treat_missing_data == "missing":
-            client.set_alarm_state(
-                AlarmName=alarm_name, StateValue=STATE_INSUFFICIENT_DATA, StateReason=REASON
-            )
-            return
-        elif treat_missing_data == "ignore":
-            return  # TODO what is the initial state for ignore?
+            update_alarm_state(client, alarm_name, alarm_state, STATE_INSUFFICIENT_DATA)
+        elif treat_missing_data == "breaching":
+            update_alarm_state(client, alarm_name, alarm_state, STATE_ALARM)
+        elif treat_missing_data == "notBreaching":
+            update_alarm_state(client, alarm_name, alarm_state, STATE_OK)
+        # 'ignore': keep the same state
+        return
 
-    datapoints = len(metric_values) - empty_datapoints
-    if datapoints < evaluation_periods:
-        # treat missing data points
-        # special case: premature alarm state https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/AlarmThatSendsEmail.html#CloudWatch-alarms-avoiding-premature-transition
-        # However, if the last few data points are - - X - -, the alarm goes into ALARM state even if missing data points
-        # are treated as missing. This is because alarms are designed to always go into ALARM state when the oldest available
-        # breaching datapoint during the Evaluation Periods number of data points is at least as old as the value of Datapoints to Alarm, and all other more recent data points are breaching or missing. In this case, the alarm goes into ALARM state even if the total number of datapoints available is lower than M (Datapoints to Alarm).
+    if is_triggering_premature_alarm(metric_values, alarm_details):
+        if treat_missing_data == "missing":
+            update_alarm_state(client, alarm_name, alarm_state, STATE_ALARM)
+        # for 'ignore' the state should be retained
+        return
 
-        if is_triggering_premature_alarm(metric_values, datapoints, alarm_details):
-            if treat_missing_data == "missing" and alarm_state != STATE_ALARM:
-                client.set_alarm_state(
-                    AlarmName=alarm_name, StateValue=STATE_ALARM, StateReason=REASON
-                )  # TODO add region?
-            # for 'ignore' the state should be retained
-            return
-
+    # collect all non-empty datapoints from the evaluation interval
     collected_datapoints = [val for val in reversed(metric_values) if val]
-    # TODO
+
+    # adding empty data points until amount of data points == "evaluation periods"
+    evaluation_periods = alarm_details["EvaluationPeriods"]
     while len(collected_datapoints) < evaluation_periods and treat_missing_data in (
         "breaching",
         "notBreaching",
@@ -196,7 +243,6 @@ def calculate_alarm_state(alarm_arn):
         collected_datapoints.append(None)
 
     if is_threshold_exceeded(collected_datapoints, alarm_details):
-        if alarm_state != STATE_ALARM:
-            client.set_alarm_state(AlarmName=alarm_name, StateValue=STATE_ALARM, StateReason=REASON)
-    elif alarm_state != STATE_OK:
-        client.set_alarm_state(AlarmName=alarm_name, StateValue=STATE_OK, StateReason=REASON)
+        update_alarm_state(client, alarm_name, alarm_state, STATE_ALARM)
+    else:
+        update_alarm_state(client, alarm_name, alarm_state, STATE_OK)

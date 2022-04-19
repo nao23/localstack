@@ -190,7 +190,7 @@ class CloudwatchProvider(CloudwatchApi, ServiceLifecycleHook):
         ROUTER.add(PATH_GET_RAW_METRICS, self.get_raw_metrics)
         self.alarm_scheduler = AlarmScheduler()  # TODO start in new thread
         # TODO init scheduler
-        # TODO restart -> persistence
+        # TODO restart -> persistence -> from all regions??
 
     def on_before_stop(self):
         # TODO shutdown scheduler
@@ -246,6 +246,7 @@ class CloudwatchProvider(CloudwatchApi, ServiceLifecycleHook):
         # Supported values are [breaching, notBreaching, ignore, missing]
         if not request.get("TreatMissingData"):
             # missing is the default
+            # TODO test with AWS
             request["TreatMissingData"] = "missing"
             moto.call_moto_with_request(context, request)
         else:
