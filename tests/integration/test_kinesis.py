@@ -98,6 +98,7 @@ class TestKinesis:
             StartingPosition={"Type": "TRIM_HORIZON"},
         )
         stream = result["EventStream"]
+        print(stream, type(stream), result)
 
         # put records
         num_records = 5

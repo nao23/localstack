@@ -473,9 +473,21 @@ class LegacyPluginHandler(Handler):
         result = do_forward_request(api, method, path_with_query, data, headers, port=None)
         # TODO: the edge proxy does a lot more to the result, so this may not work for all corner cases
 
+        print(">>> RESULT ", result)
+
+        if isinstance(result, tuple):
+            if len(result) == 2:
+                response.status_code = 200
+                response.set_response(result[0])
+                response.headers.update(dict(result[1]))
+                chain.stop()
+                return
+            raise ValueError("cannot create response for result %s" % result)
+
         response.status_code = result.status_code
-        response.data = result.content
+        response.set_response(result.content)
         response.headers.update(dict(result.headers))
+        chain.stop()
 
 
 class EmptyResponseHandler(Handler):

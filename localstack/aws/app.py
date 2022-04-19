@@ -133,12 +133,12 @@ class LocalstackAwsGateway(Gateway):
 
 
 def main():
-    from .serving import wsgi
+    from .serving.hypercorn import serve
 
     # serve the LocalStackAwsGateway in a dev app
     logging.basicConfig(level=logging.WARNING)
     gw = LocalstackAwsGateway()
-    wsgi.serve(gw, use_reloader=True)
+    serve(gw, use_reloader=True)
 
 
 if __name__ == "__main__":
